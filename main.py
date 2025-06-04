@@ -9,11 +9,14 @@ built-in async support and Uvicorn's event loop.
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, Any
+import time
+
+# Import our custom modules
+from models import HealthResponse, ServerInfo, TextGenerationRequest, TextGenerationResponse, ModelStatus
+from model_service import T5ModelService
 
 # Configure logging for the application
 logging.basicConfig(
@@ -22,30 +25,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize the T5 model service
+model_service = T5ModelService()
+
 # Initialize FastAPI application with metadata
 app = FastAPI(
     title="HuggingFace Model Inference Server",
     description="A FastAPI server for processing inference requests using HuggingFace models",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",  # Swagger UI documentation endpoint
     redoc_url="/redoc"  # ReDoc documentation endpoint
 )
-
-
-# Pydantic models for request/response validation
-class HealthResponse(BaseModel):
-    """Response model for health check endpoints."""
-    status: str
-    timestamp: str
-    message: str
-
-
-class ServerInfo(BaseModel):
-    """Response model for server information."""
-    name: str
-    version: str
-    description: str
-    endpoints: list
 
 
 # Application startup and shutdown event handlers
@@ -55,10 +45,19 @@ async def startup_event():
     Application startup event handler.
     
     This function runs when the FastAPI application starts up.
-    It's where we'll initialize resources, load models, and set up
-    any necessary background tasks.
+    It loads the T5-small model and initializes all necessary resources.
     """
     logger.info("🚀 Starting HuggingFace Model Inference Server")
+    
+    try:
+        # Load the T5-small model asynchronously
+        await model_service.load_model()
+        logger.info("✅ Model loading completed successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to load model during startup: {str(e)}")
+        # Continue startup even if model loading fails
+        # The model status endpoint will show the error state
+    
     logger.info("Server initialization complete")
 
 
@@ -86,9 +85,9 @@ async def root():
     """
     return ServerInfo(
         name="HuggingFace Model Inference Server",
-        version="1.0.0",
+        version="2.0.0",
         description="FastAPI server for ML model inference using HuggingFace transformers",
-        endpoints=["/", "/health", "/health/ready", "/health/live"]
+        endpoints=["/", "/health", "/health/ready", "/health/live", "/model/status", "/generate"]
     )
 
 
@@ -117,24 +116,26 @@ async def readiness_check():
     Readiness check endpoint for Kubernetes/container orchestration.
     
     This endpoint indicates whether the server is ready to accept traffic.
-    In future iterations, this will check if models are loaded and
-    all dependencies are available.
+    It checks if the model is loaded and ready for inference.
     
     Returns:
         HealthResponse: Readiness status of the server
     """
-    # In future PRs, we'll add actual readiness checks here
-    # For now, we assume the server is ready if it's responding
-    
     try:
-        # Simulate a quick async operation to test server responsiveness
-        await asyncio.sleep(0.001)
-        
-        return HealthResponse(
-            status="ready",
-            timestamp=datetime.utcnow().isoformat(),
-            message="Server is ready to accept requests"
-        )
+        # Check if the model is loaded and ready
+        if model_service.is_model_ready():
+            return HealthResponse(
+                status="ready",
+                timestamp=datetime.utcnow().isoformat(),
+                message="Server and model are ready to accept requests"
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="Model is not loaded yet. Server is not ready for inference requests."
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Readiness check failed: {str(e)}")
         raise HTTPException(
@@ -169,6 +170,83 @@ async def liveness_check():
         raise HTTPException(
             status_code=500,
             detail="Server liveness check failed"
+        )
+
+
+# Model-specific endpoints
+@app.get("/model/status", response_model=ModelStatus)
+async def get_model_status():
+    """
+    Get the current status of the T5-small model.
+    
+    This endpoint provides information about whether the model is loaded
+    and ready for inference operations.
+    
+    Returns:
+        ModelStatus: Current status of the model
+    """
+    model_info = model_service.get_model_info()
+    
+    status = "ready" if model_info["model_ready"] else "loading" if not model_info["is_loaded"] else "error"
+    
+    return ModelStatus(
+        model_name=model_info["model_name"],
+        is_loaded=model_info["is_loaded"],
+        status=status,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
+@app.post("/generate", response_model=TextGenerationResponse)
+async def generate_text(request: TextGenerationRequest):
+    """
+    Generate text using the T5-small model.
+    
+    This endpoint accepts text input and generates output using the T5-small
+    model for text-to-text generation tasks such as translation, summarization,
+    and question answering.
+    
+    Args:
+        request: TextGenerationRequest containing input text and generation parameters
+        
+    Returns:
+        TextGenerationResponse: Generated text with metadata
+        
+    Raises:
+        HTTPException: If model is not ready or generation fails
+    """
+    logger.info(f"Received text generation request: '{request.text[:50]}...'")
+    
+    try:
+        # Generate text using the model service
+        generated_text, generation_time = await model_service.generate_text(
+            input_text=request.text,
+            max_length=request.max_length,
+            temperature=request.temperature,
+            num_beams=request.num_beams
+        )
+        
+        # Create response
+        response = TextGenerationResponse(
+            generated_text=generated_text,
+            input_text=request.text,
+            model_name=model_service.model_name,
+            generation_time_seconds=generation_time,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        
+        logger.info(f"Successfully generated text in {generation_time:.3f}s")
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (from model_service)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in text generation: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Text generation failed: {str(e)}"
         )
 
 

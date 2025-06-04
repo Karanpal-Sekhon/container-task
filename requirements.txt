@@ -7,6 +7,7 @@ pydantic==2.5.0
 transformers==4.36.0
 torch==2.1.1
 tokenizers==0.15.0
+sentencepiece
 
 # HTTP client for testing and requests
 httpx==0.25.2

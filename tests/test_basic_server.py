@@ -38,7 +38,7 @@ class TestServerBasics:
         # The fact that we can create a TestClient means the app loaded successfully
         assert app is not None
         assert app.title == "HuggingFace Model Inference Server"
-        assert app.version == "1.0.0"
+        assert app.version == "2.0.0"
     
     def test_root_endpoint(self):
         """
@@ -65,7 +65,7 @@ class TestServerBasics:
         
         # Verify specific values
         assert data["name"] == "HuggingFace Model Inference Server"
-        assert data["version"] == "1.0.0"
+        assert data["version"] == "2.0.0"
         assert isinstance(data["endpoints"], list)
         assert len(data["endpoints"]) > 0
         
@@ -115,27 +115,29 @@ class TestHealthEndpoints:
         """
         Test the readiness check endpoint (/health/ready).
         
-        This test verifies:
-        - Endpoint returns HTTP 200 when server is ready
-        - Response indicates readiness status
-        - Async operations are working correctly
+        This test verifies that the readiness endpoint properly checks
+        model status and returns appropriate response codes.
         """
         response = client.get("/health/ready")
         
-        # Check HTTP status code
-        assert response.status_code == 200
+        # During testing, model may not be loaded, so we expect either:
+        # - 200 if model is loaded and ready
+        # - 503 if model is not loaded yet
+        assert response.status_code in [200, 503]
         
-        # Parse JSON response
-        data = response.json()
-        
-        # Verify response structure
-        assert "status" in data
-        assert "timestamp" in data
-        assert "message" in data
-        
-        # Verify readiness status
-        assert data["status"] == "ready"
-        assert "ready to accept requests" in data["message"]
+        if response.status_code == 200:
+            # Model is loaded and ready
+            data = response.json()
+            assert "status" in data
+            assert "timestamp" in data
+            assert "message" in data
+            assert data["status"] == "ready"
+            assert "ready to accept requests" in data["message"]
+        else:
+            # Model is not loaded (expected during testing)
+            data = response.json()
+            assert "detail" in data
+            assert "not loaded yet" in data["detail"]
     
     def test_liveness_check(self):
         """
@@ -220,19 +222,36 @@ class TestResponseValidation:
         This test verifies that all health endpoints return data that
         matches the expected Pydantic model structure.
         """
-        endpoints_to_test = ["/health", "/health/ready", "/health/live"]
+        # Test basic health endpoint (should always return 200)
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        required_fields = ["status", "timestamp", "message"]
+        for field in required_fields:
+            assert field in data, f"Field '{field}' missing from /health response"
+            assert isinstance(data[field], str), f"Field '{field}' should be string in /health"
         
-        for endpoint in endpoints_to_test:
-            response = client.get(endpoint)
-            assert response.status_code == 200
-            
+        # Test liveness endpoint (should always return 200)
+        response = client.get("/health/live")
+        assert response.status_code == 200
+        data = response.json()
+        for field in required_fields:
+            assert field in data, f"Field '{field}' missing from /health/live response"
+            assert isinstance(data[field], str), f"Field '{field}' should be string in /health/live"
+        
+        # Test readiness endpoint (may return 503 if model not loaded)
+        response = client.get("/health/ready")
+        if response.status_code == 200:
+            # Model is ready - check HealthResponse format
             data = response.json()
-            
-            # All health responses should have these fields
-            required_fields = ["status", "timestamp", "message"]
             for field in required_fields:
-                assert field in data, f"Field '{field}' missing from {endpoint} response"
-                assert isinstance(data[field], str), f"Field '{field}' should be string in {endpoint}"
+                assert field in data, f"Field '{field}' missing from /health/ready response"
+                assert isinstance(data[field], str), f"Field '{field}' should be string in /health/ready"
+        else:
+            # Model not ready - check error response format
+            assert response.status_code == 503
+            data = response.json()
+            assert "detail" in data, "Error response should have 'detail' field"
     
     def test_server_info_response_model_validation(self):
         """
@@ -299,21 +318,26 @@ class TestAsyncFunctionality:
         """
         import concurrent.futures
         
-        endpoints = ["/", "/health", "/health/ready", "/health/live"]
+        # Use endpoints that should reliably return 200
+        endpoints = ["/", "/health", "/health/live"]
         
         def make_request(endpoint):
             """Helper function to make a request to a specific endpoint."""
             return client.get(endpoint)
         
         # Make concurrent requests to different endpoints
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(make_request, endpoint) for endpoint in endpoints]
             responses = [future.result() for future in concurrent.futures.as_completed(futures)]
         
         # Verify all requests succeeded
-        assert len(responses) == 4
+        assert len(responses) == 3
         for response in responses:
             assert response.status_code == 200
+            
+        # Test readiness endpoint separately since it may return 503
+        response = client.get("/health/ready")
+        assert response.status_code in [200, 503]
 
 
 class TestErrorHandling:
